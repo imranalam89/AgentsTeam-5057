@@ -537,8 +537,11 @@ class MultiBrokerAccountClient:
         self.tradovate_token_expiry = 0.0
         self.tradovate_resolved_acct_id: Optional[int] = None
 
-        self.wallet_balance_usd = float(acct_dict.get("wallet_balance_usd", 100.0))
-        self.free_margin_usd = float(acct_dict.get("free_margin_usd", 100.0))
+        default_bal = 50000.0 if self.broker_type in ("PICKMYTRADE", "TRADOVATE_API") else 100.0
+        raw_bal = acct_dict.get("wallet_balance_usd")
+        raw_free = acct_dict.get("free_margin_usd")
+        self.wallet_balance_usd = float(raw_bal) if raw_bal is not None else default_bal
+        self.free_margin_usd = float(raw_free) if raw_free is not None else self.wallet_balance_usd
         self.last_balance_ts = 0.0
 
     @property
@@ -1851,9 +1854,11 @@ class UnifiedFloorHub:
     def send_telegram(self, text: str, kind: str = "info") -> Tuple[bool, str]:
         tg = self.telegram
         token = str(tg.get("bot_token", "")).strip()
+        if token.lower().startswith("bot") and ":" in token:
+            token = token[3:].strip()
         chat_id = str(tg.get("chat_id", "")).strip()
         if not token or not chat_id:
-            return False, "Telegram Bot Token or Chat ID not configured"
+            return False, "Telegram Bot Token or Chat ID not configured (enter both and click Save or Send Test Alert)"
         if kind == "open" and not tg.get("alert_open", True):
             return False, "Open alerts disabled"
         if kind == "partial" and not tg.get("alert_partial", True):
@@ -1879,6 +1884,18 @@ class UnifiedFloorHub:
                 if res.get("ok"):
                     return True, "Sent"
                 return False, str(res.get("description", "Telegram error"))
+        except urllib.error.HTTPError as e:
+            err_raw = e.read().decode("utf-8", errors="replace")
+            desc = err_raw
+            try:
+                desc = str(json.loads(err_raw).get("description") or err_raw)
+            except Exception:
+                pass
+            if "chat not found" in desc.lower():
+                return False, "Telegram: Chat not found — open your Bot in Telegram and press Start (/start) first!"
+            if e.code == 401 or "unauthorized" in desc.lower():
+                return False, "Telegram: Invalid Bot Token — copy the exact token from @BotFather."
+            return False, f"Telegram HTTP {e.code}: {desc}"
         except Exception as e:
             return False, str(e)
 
@@ -4434,7 +4451,11 @@ class UnifiedStrategyEngine:
 
         with HUB.lock:
             HUB.open_positions.pop(key, None)
+            if not (acct.broker_type == "DELTA" and acct.is_live_authenticated):
+                acct.wallet_balance_usd = round(float(acct.wallet_balance_usd) + net_usd, 2)
+                acct.free_margin_usd = round(float(acct.free_margin_usd) + net_usd, 2)
             HUB.save_trade(closed_row)
+            HUB.save_runtime_config()
             def_acct = HUB.get_default_account()
             is_primary_acct = (def_acct is None) or (acct.id == def_acct.id) or (acct.broker_type == "DELTA")
             if is_primary_acct:
@@ -5505,7 +5526,10 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
         if path == "/api/admin/telegram":
             with HUB.lock:
                 if body.get("bot_token"):
-                    HUB.telegram["bot_token"] = str(body["bot_token"]).strip()
+                    tok_clean = str(body["bot_token"]).strip()
+                    if tok_clean.lower().startswith("bot") and ":" in tok_clean:
+                        tok_clean = tok_clean[3:].strip()
+                    HUB.telegram["bot_token"] = tok_clean
                 if "chat_id" in body:
                     HUB.telegram["chat_id"] = str(body.get("chat_id", "")).strip()
                 if "daily_summary_ist" in body:
@@ -5514,16 +5538,38 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     if k in body:
                         HUB.telegram[k] = bool(body[k])
                 HUB.save_runtime_config()
-            self._send_json({"success": True})
+                masked = mask_secret(HUB.telegram.get("bot_token", ""), "tg_")
+            self._send_json({"success": True, "bot_token_masked": masked})
             return
 
         if path == "/api/admin/telegram/test":
+            with HUB.lock:
+                changed = False
+                if body.get("bot_token"):
+                    tok_clean = str(body["bot_token"]).strip()
+                    if tok_clean.lower().startswith("bot") and ":" in tok_clean:
+                        tok_clean = tok_clean[3:].strip()
+                    HUB.telegram["bot_token"] = tok_clean
+                    changed = True
+                if body.get("chat_id"):
+                    HUB.telegram["chat_id"] = str(body["chat_id"]).strip()
+                    changed = True
+                if body.get("daily_summary_ist"):
+                    HUB.telegram["daily_summary_ist"] = str(body["daily_summary_ist"]).strip()
+                    changed = True
+                for k in ("alert_open", "alert_partial", "alert_close", "alert_daily", "alert_error"):
+                    if k in body:
+                        HUB.telegram[k] = bool(body[k])
+                        changed = True
+                if changed:
+                    HUB.save_runtime_config()
+                masked = mask_secret(HUB.telegram.get("bot_token", ""), "tg_")
             ok, msg = HUB.send_telegram(
                 "✅ <b>TRADING JOURNAL · MULTI-BROKER 3-ASSET FLOOR (PORT 5057)</b>\n"
                 "Telegram alert connection verified! Live multi-broker alerts &amp; IST daily summaries are active.",
                 kind="test",
             )
-            self._send_json({"success": ok, "error": None if ok else msg})
+            self._send_json({"success": ok, "error": None if ok else msg, "bot_token_masked": masked})
             return
 
         self._send_json({"success": False, "error": "Unknown endpoint"}, code=404)

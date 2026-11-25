@@ -1093,6 +1093,13 @@
               <option value="RISK_USD">FIXED RISK ($) (Auto-calc from SL Distance)</option>
             </select>
           </div>
+          <div>
+            <label for="acctWalletBalance" class="field-lbl">Account Balance / Equity ($)</label>
+            <input type="number" id="acctWalletBalance" class="input-dark mono" style="width:100%;" step="0.01" min="1" value="100" placeholder="e.g. 50000 for Tradovate Demo" />
+          </div>
+          <div style="display:flex; align-items:flex-end;">
+            <span id="acctBalanceHint" class="mono text-muted" style="font-size:10.5px; padding-bottom:6px;">PickMyTrade/Webhook is one-way; set your Tradovate starting balance here (auto-tracks +Net P&amp;L).</span>
+          </div>
         </div>
 
         <!-- Dynamic Broker Panels -->
@@ -2811,7 +2818,17 @@
       }
       if (!keepPairConfigs) {
         document.getElementById('acctSizingMode').value = (btype === 'DELTA') ? 'RISK_USD' : 'FIXED_LOT';
+        const balEl = document.getElementById('acctWalletBalance');
+        if (balEl && !document.getElementById('acctEditId').value) {
+          balEl.value = (btype === 'PICKMYTRADE' || btype === 'TRADOVATE_API') ? 50000 : 100;
+        }
         populatePairMatrix(BROKER_PAIR_DEFAULTS[btype] || BROKER_PAIR_DEFAULTS.DELTA);
+      }
+      const balHint = document.getElementById('acctBalanceHint');
+      if (balHint) {
+        balHint.textContent = (btype === 'DELTA')
+          ? 'LIVE Delta pulls real wallet balance via API; PAPER mode uses this starting balance + Net P&L.'
+          : 'Webhook/PickMyTrade is one-way (cannot read Tradovate balance). Enter your account size (e.g. 50000) & we auto-add realized P&L.';
       }
       onSizingModeChange();
       onWebhookPresetChange();
@@ -3105,6 +3122,11 @@
       document.getElementById('acctMode').value = a ? a.mode : 'LIVE';
       document.getElementById('acctSizingMode').value = a ? (a.sizing_mode || 'RISK_USD') : (btype === 'DELTA' ? 'RISK_USD' : 'FIXED_LOT');
       document.getElementById('acctRiskUsd').value = a ? (a.risk_usd || 5) : 5;
+      if (document.getElementById('acctWalletBalance')) {
+        document.getElementById('acctWalletBalance').value = a
+          ? Number(a.wallet_balance_usd ?? 100)
+          : ((btype === 'PICKMYTRADE' || btype === 'TRADOVATE_API') ? 50000 : 100);
+      }
       document.getElementById('acctIsDefault').checked = a ? Boolean(a.is_default) : false;
 
       // Delta fields
@@ -3192,6 +3214,7 @@
         };
       });
 
+      const balVal = Number(document.getElementById('acctWalletBalance')?.value || 100);
       const payload = {
         id: document.getElementById('acctEditId').value || undefined,
         label: document.getElementById('acctLabel').value.trim(),
@@ -3199,6 +3222,8 @@
         mode: document.getElementById('acctMode').value,
         sizing_mode: document.getElementById('acctSizingMode').value,
         risk_usd: Number(document.getElementById('acctRiskUsd').value || 5),
+        wallet_balance_usd: balVal,
+        free_margin_usd: balVal,
         enabled_pairs,
         pair_configs,
         is_default: document.getElementById('acctIsDefault').checked
@@ -3475,18 +3500,22 @@
       }
     }
 
+    function readTelegramFormPayload() {
+      return {
+        bot_token: document.getElementById('tgBotToken')?.value.trim() || undefined,
+        chat_id: document.getElementById('tgChatId')?.value.trim() || '',
+        daily_summary_ist: document.getElementById('tgDailyTime')?.value.trim() || '23:55',
+        alert_open: Boolean(document.getElementById('tgAlertOpen')?.checked),
+        alert_partial: Boolean(document.getElementById('tgAlertPartial')?.checked),
+        alert_close: Boolean(document.getElementById('tgAlertClose')?.checked),
+        alert_daily: Boolean(document.getElementById('tgAlertDaily')?.checked),
+        alert_error: Boolean(document.getElementById('tgAlertError')?.checked)
+      };
+    }
+
     async function saveTelegramConfig(e) {
       e.preventDefault();
-      const payload = {
-        bot_token: document.getElementById('tgBotToken').value.trim() || undefined,
-        chat_id: document.getElementById('tgChatId').value.trim(),
-        daily_summary_ist: document.getElementById('tgDailyTime').value.trim(),
-        alert_open: document.getElementById('tgAlertOpen').checked,
-        alert_partial: document.getElementById('tgAlertPartial').checked,
-        alert_close: document.getElementById('tgAlertClose').checked,
-        alert_daily: document.getElementById('tgAlertDaily').checked,
-        alert_error: document.getElementById('tgAlertError').checked
-      };
+      const payload = readTelegramFormPayload();
       if (IS_FILE_PREVIEW) {
         previewStore.telegram = { ...previewStore.telegram, ...payload };
         showToast('Telegram settings saved (preview)', 'ok');
@@ -3498,19 +3527,35 @@
         });
         const data = await res.json();
         if (!res.ok || !data.success) throw new Error(data.error || 'Save failed');
-        showToast('Telegram settings saved', 'ok');
+        state.telegramCfg = { ...(state.telegramCfg || {}), ...payload, bot_token_masked: data.bot_token_masked || (state.telegramCfg || {}).bot_token_masked };
+        const tokInput = document.getElementById('tgBotToken');
+        if (tokInput) {
+          tokInput.value = '';
+          if (data.bot_token_masked) tokInput.placeholder = data.bot_token_masked;
+        }
+        showToast('Telegram settings saved!', 'ok');
       } catch (err) {
         showToast(err.message || 'Could not save Telegram settings', 'err');
       }
     }
 
     async function sendTestTelegram() {
+      const payload = readTelegramFormPayload();
       if (IS_FILE_PREVIEW) { showToast('Preview: Test Telegram message queued', 'ok'); return; }
       try {
-        const res = await fetch('/api/admin/telegram/test', { method: 'POST' });
+        const res = await fetch('/api/admin/telegram/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
         const data = await res.json();
         if (!res.ok || !data.success) throw new Error(data.error || 'Test alert failed');
-        showToast('Test Telegram alert sent!', 'ok');
+        const tokInput = document.getElementById('tgBotToken');
+        if (tokInput && data.bot_token_masked) {
+          tokInput.value = '';
+          tokInput.placeholder = data.bot_token_masked;
+        }
+        showToast('Saved & sent Test Telegram alert!', 'ok');
       } catch (err) {
         showToast(err.message || 'Telegram test failed', 'err');
       }
