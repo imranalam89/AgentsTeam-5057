@@ -1645,12 +1645,16 @@ class UnifiedFloorHub:
             "bot_token": ENV_CFG["TELEGRAM_BOT_TOKEN"],
             "chat_id": ENV_CFG["TELEGRAM_CHAT_ID"],
             "daily_summary_ist": ENV_CFG["TELEGRAM_DAILY_IST"] or "23:55",
+            "alert_scope": "CONSOLIDATED",
             "alert_open": True,
             "alert_partial": True,
             "alert_close": True,
             "alert_daily": True,
             "alert_error": True,
         }
+        self._tg_dedup: Dict[str, float] = {}
+        self._tg_close_buf: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], MultiBrokerAccountClient]]] = {}
+        self._tg_trail_buf: Dict[Tuple[str, str, str], List[Tuple[Dict[str, Any], MultiBrokerAccountClient]]] = {}
         self.last_daily_summary_date: str = ""
         self.executor = ThreadPoolExecutor(max_workers=10)
         self.load_runtime_config()
@@ -1901,6 +1905,124 @@ class UnifiedFloorHub:
 
     def send_telegram_async(self, text: str, kind: str = "info"):
         self.executor.submit(self.send_telegram, text, kind)
+
+    def account_matches_telegram_scope(self, acct: MultiBrokerAccountClient) -> bool:
+        scope = str(self.telegram.get("alert_scope", "CONSOLIDATED")).upper()
+        if scope == "LIVE_ONLY":
+            return acct.mode == "LIVE"
+        if scope == "DEFAULT_ONLY":
+            def_a = self.get_default_account()
+            return bool(def_a and acct.id == def_a.id)
+        return True
+
+    def queue_trail_or_partial_telegram(
+        self,
+        event_kind: str,
+        milestone_key: str,
+        title_label: str,
+        pos: Dict[str, Any],
+        acct: MultiBrokerAccountClient,
+        detail_str: str,
+    ):
+        """Consolidates Trailing SL / Partial TP updates across all accounts into ONE single Telegram message."""
+        if not self.account_matches_telegram_scope(acct):
+            return
+        sym = str(pos["symbol"])
+        direc = str(pos["direction"])
+        dedup_k = f"{event_kind}|{sym}|{direc}|{milestone_key}"
+        bkey = (sym, direc, milestone_key)
+        first_item = False
+        with self.lock:
+            now_f = time.time()
+            # Prune expired dedup keys
+            if len(self._tg_dedup) > 300:
+                for dk in [k for k, ts_v in self._tg_dedup.items() if now_f - ts_v > 14400]:
+                    self._tg_dedup.pop(dk, None)
+            # Block duplicate firing for the same milestone after flush
+            if dedup_k in self._tg_dedup and (now_f - self._tg_dedup[dedup_k]) > 1.5:
+                return
+            if bkey not in self._tg_trail_buf:
+                self._tg_dedup[dedup_k] = now_f
+                self._tg_trail_buf[bkey] = []
+                first_item = True
+            self._tg_trail_buf[bkey].append((
+                {
+                    "title": title_label,
+                    "event_kind": event_kind,
+                    "entry_price": float(pos["entry_price"]),
+                    "cur_sl": float(pos["cur_sl"]),
+                    "current_price": float(pos.get("current_price", pos["entry_price"])),
+                    "detail": detail_str,
+                },
+                acct,
+            ))
+
+        if first_item:
+            def _flush_trail():
+                time.sleep(1.0)
+                with self.lock:
+                    items = self._tg_trail_buf.pop(bkey, [])
+                if not items:
+                    return
+                meta0 = items[0][0]
+                hdr_icon = "🎯" if meta0["event_kind"] == "PARTIAL" else "🛡️"
+                lines = [
+                    f"{hdr_icon} <b>{meta0['title']} · {sym} ({direc})</b>",
+                    f"Entry: <b>${meta0['entry_price']:.2f}</b> → Live: <b>${meta0['current_price']:.2f}</b>",
+                    f"Protected SL: <b>${meta0['cur_sl']:.2f}</b>",
+                ]
+                seen_ids = set()
+                for m_item, a_obj in items:
+                    if a_obj.id in seen_ids:
+                        continue
+                    seen_ids.add(a_obj.id)
+                    lines.append(f"• <b>{a_obj.label}</b> [{a_obj.mode}]: {m_item['detail']}")
+                self.send_telegram("\n".join(lines), kind="partial")
+
+            self.executor.submit(_flush_trail)
+
+    def queue_close_telegram(self, closed_row: Dict[str, Any], acct: MultiBrokerAccountClient):
+        """Consolidates simultaneous multi-account exits on the same trade into ONE single Telegram message."""
+        if not self.account_matches_telegram_scope(acct):
+            return
+        sym = str(closed_row["symbol"])
+        direc = str(closed_row["direction"])
+        bkey = (sym, direc)
+        first_item = False
+        with self.lock:
+            if bkey not in self._tg_close_buf:
+                self._tg_close_buf[bkey] = []
+                first_item = True
+            self._tg_close_buf[bkey].append((dict(closed_row), acct))
+
+        if first_item:
+            def _flush_close():
+                time.sleep(1.2)
+                with self.lock:
+                    items = self._tg_close_buf.pop(bkey, [])
+                if not items:
+                    return
+                r0 = items[0][0]
+                any_win = any(float(x[0].get("net_pnl_usd", 0.0)) >= 0 for x in items)
+                icon = "🟢" if any_win else "🔴"
+                lines = [
+                    f"{icon} <b>TRADE CLOSED · {sym} ({direc})</b>",
+                    f"Reason: <b>{r0['exit_reason']}</b>",
+                    f"Entry: <b>${float(r0['entry_price']):.2f}</b> → Exit: <b>${float(r0['exit_price']):.2f}</b> ({float(r0['r_multiple']):+.2f}R)",
+                ]
+                seen_ids = set()
+                for row_i, a_obj in items:
+                    if a_obj.id in seen_ids:
+                        continue
+                    seen_ids.add(a_obj.id)
+                    net_v = float(row_i.get("net_pnl_usd", 0.0))
+                    b_sym = row_i.get("broker_symbol", sym)
+                    lines.append(
+                        f"• <b>{a_obj.label}</b> [{a_obj.mode} · {b_sym}]: <b>${net_v:+.2f}</b>"
+                    )
+                self.send_telegram("\n".join(lines), kind="close")
+
+            self.executor.submit(_flush_close)
 
     def check_ist_daily_summary(self):
         tg = self.telegram
@@ -3997,17 +4119,40 @@ class UnifiedStrategyEngine:
                 f"[👑 ENTRY {symbol} -> {acct.broker_type}:{b_sym}] Account={acct.label} | {direction} {lots} Lots @ ${fill_px:.2f} "
                 f"| SL_Dist=${sl_dist:.2f} ({sig['sl_tier']}) | Agent={sig['setup_agent']}"
             )
-            HUB.send_telegram_async(
-                f"🚀 <b>TRADE OPENED · {symbol} ({direction})</b>\n"
-                f"Broker: <b>{acct.broker_type}</b> ({b_sym}) · <b>{acct.label}</b> [{acct.mode}]\n"
-                f"Agent: <b>{sig['setup_agent']}</b> ({sig['tf']} · {sig['playbook']})\n"
-                f"Ref Price: <b>${fill_px:.2f}</b> | Size: <b>{lots}</b>\n"
-                f"SL Distance: <b>{sl_dist:.2f} pts</b> ({sig['sl_tier']})",
-                kind="open",
-            )
+            return {
+                "acct": acct,
+                "b_sym": b_sym,
+                "lots": fmt_qty_json(lots),
+                "fill_px": fill_px,
+                "init_sl": init_sl,
+            }
 
-        for acct in accounts:
-            HUB.executor.submit(_open_for_account, acct)
+        def _fanout_and_notify_open():
+            futs = [HUB.executor.submit(_open_for_account, acct) for acct in accounts]
+            opened_items = []
+            for fut in futs:
+                try:
+                    res_item = fut.result(timeout=12.0)
+                    if res_item and HUB.account_matches_telegram_scope(res_item["acct"]):
+                        opened_items.append(res_item)
+                except Exception:
+                    pass
+            if not opened_items:
+                return
+            first = opened_items[0]
+            lines = [
+                f"🚀 <b>TRADE OPENED · {symbol} ({direction})</b>",
+                f"Agent: <b>{sig['setup_agent']}</b> ({sig['tf']} · {sig['playbook']})",
+                f"Entry: <b>${first['fill_px']:.2f}</b> → Init SL: <b>${first['init_sl']:.2f}</b> ({sl_dist:.2f} pts · {sig['sl_tier']})",
+            ]
+            for it in opened_items:
+                a_obj = it["acct"]
+                lines.append(
+                    f"• <b>{a_obj.label}</b> [{a_obj.mode} · {it['b_sym']}]: <b>{it['lots']}</b> @ ${it['fill_px']:.2f}"
+                )
+            HUB.send_telegram("\n".join(lines), kind="open")
+
+        HUB.executor.submit(_fanout_and_notify_open)
 
     def _record_partial_scale_out(self, acct: MultiBrokerAccountClient, pos: Dict[str, Any], take_lots: float, fill_px: float, fee_rate: float, tag: str):
         symbol = pos["symbol"]
@@ -4055,12 +4200,13 @@ class UnifiedStrategyEngine:
             trail_offset = s_mult * (float(pos["cur_sl"]) - float(pos["entry_price"]))
             acct.dispatch_broker_action("MODIFY_SL", symbol, pos["direction"], float(pos["lots"]), fill_px, pos["sl_dist"], float(pos.get("tp_dist", 0.0)), trail_offset=trail_offset, reason=tag)
 
-        HUB.send_telegram_async(
-            f"🎯 <b>PARTIAL TP ({tag}) · {symbol}</b>\n"
-            f"Broker: <b>{acct.broker_type}</b> · <b>{acct.label}</b>\n"
-            f"Scaled Out: <b>{take_lots} @ ${fill_px:.2f}</b>\n"
-            f"Remaining Runner: <b>{pos['lots']}</b> (SL @ ${pos['cur_sl']:.2f})",
-            kind="partial",
+        HUB.queue_trail_or_partial_telegram(
+            event_kind="PARTIAL",
+            milestone_key=f"PARTIAL_{tag}_{int(pos.get('entry_ts', 0) // 60)}",
+            title_label=f"PARTIAL TP ({tag})",
+            pos=pos,
+            acct=acct,
+            detail_str=f"Scaled {fmt_qty_json(take_lots)} @ ${fill_px:.2f} (Runner: {pos['lots']})",
         )
 
     def manage_position(self, account_id: str, symbol: str, h_px: float, l_px: float, c_px: float, is_bar_close: bool = False, ctx: Optional[Dict[str, Any]] = None):
@@ -4350,6 +4496,36 @@ class UnifiedStrategyEngine:
                     sl_dist, float(pos.get("tp_dist", 0.0)), trail_offset=trail_offset,
                     reason=pos.get("stage_reason") or "TRAIL_SL",
                 )
+            # Send ONE consolidated Trailing SL milestone alert (throttled to stage/0.5R milestones, never 1s spam)
+            locked_r = round(s_mult * (float(pos["cur_sl"]) - e_px) / max(sl_dist, 1e-6), 2)
+            st_reason = str(pos.get("stage_reason") or "TRAIL_SL")
+            entry_bucket = int(pos.get("entry_ts", 0) // 60)
+            milestone_id = ""
+            milestone_title = ""
+            if st_reason == "SMART_STALL_LOCK" and not pos.get("alerted_stall"):
+                pos["alerted_stall"] = True
+                milestone_id = f"STALL_{entry_bucket}"
+                milestone_title = "TRAILING SL (STALL LOCK)"
+            elif st_reason in ("BREAKEVEN", "TP1_FLOOR", "TP2_FLOOR") and not pos.get("alerted_be"):
+                pos["alerted_be"] = True
+                milestone_id = f"BE_{entry_bucket}"
+                milestone_title = "BREAKEVEN LOCKED"
+            elif pos.get("stage", 0) >= 4:
+                step_half_r = int(math.floor(max(0.0, locked_r) * 2.0))  # 1=+0.5R, 2=+1.0R, 3=+1.5R...
+                prev_step = int(pos.get("last_trail_alert_step", 0))
+                if step_half_r >= 1 and step_half_r > prev_step:
+                    pos["last_trail_alert_step"] = step_half_r
+                    milestone_id = f"RATCHET_{entry_bucket}_{step_half_r}"
+                    milestone_title = f"TRAILING SL (+{step_half_r * 0.5:.1f}R LOCKED)"
+            if milestone_id:
+                HUB.queue_trail_or_partial_telegram(
+                    event_kind="TRAIL",
+                    milestone_key=milestone_id,
+                    title_label=milestone_title,
+                    pos=pos,
+                    acct=acct,
+                    detail_str=f"SL → ${float(pos['cur_sl']):.2f} ({locked_r:+.2f}R)",
+                )
 
         # 9. Time Cycle Exit
         if pos["hold_mins"] >= int(pos.get("max_hold_mins", 270)):
@@ -4479,15 +4655,7 @@ class UnifiedStrategyEngine:
             f"[✅ CLOSED {symbol} ({acct.broker_type})] Account={acct.label} | {pos['direction']} Exit @ ${exit_px:.2f} ({full_reason}) "
             f"| Gross=${gross_usd:+.2f} | Net=${net_usd:+.2f} ({r_mult:+.2f}R)"
         )
-        icon = "🟢" if net_usd >= 0 else "🔴"
-        HUB.send_telegram_async(
-            f"{icon} <b>TRADE CLOSED · {symbol} ({pos['direction']})</b>\n"
-            f"Broker: <b>{acct.broker_type}</b> · <b>{acct.label}</b>\n"
-            f"Reason: <b>{full_reason}</b>\n"
-            f"Ref Entry: <b>${e_px:.2f}</b> &rarr; Exit: <b>${exit_px:.2f}</b> ({r_mult:+.2f}R)\n"
-            f"Net Realized P&amp;L: <b>${net_usd:+.2f}</b>",
-            kind="close",
-        )
+        HUB.queue_close_telegram(closed_row, acct)
 
     def sync_all_accounts_positions(self):
         """Every 5 seconds, reconciles RAM open_positions and resting exchange SL/TP across LIVE Delta accounts."""
@@ -5107,6 +5275,7 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     "bot_token_masked": mask_secret(tg.get("bot_token", ""), "tg_"),
                     "chat_id": tg.get("chat_id", ""),
                     "daily_summary_ist": tg.get("daily_summary_ist", "23:55"),
+                    "alert_scope": str(tg.get("alert_scope", "CONSOLIDATED")),
                     "alert_open": bool(tg.get("alert_open", True)),
                     "alert_partial": bool(tg.get("alert_partial", True)),
                     "alert_close": bool(tg.get("alert_close", True)),
@@ -5534,6 +5703,8 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     HUB.telegram["chat_id"] = str(body.get("chat_id", "")).strip()
                 if "daily_summary_ist" in body:
                     HUB.telegram["daily_summary_ist"] = str(body.get("daily_summary_ist", "23:55")).strip()
+                if "alert_scope" in body and str(body["alert_scope"]).upper() in ("CONSOLIDATED", "LIVE_ONLY", "DEFAULT_ONLY"):
+                    HUB.telegram["alert_scope"] = str(body["alert_scope"]).upper()
                 for k in ("alert_open", "alert_partial", "alert_close", "alert_daily", "alert_error"):
                     if k in body:
                         HUB.telegram[k] = bool(body[k])
@@ -5556,6 +5727,9 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     changed = True
                 if body.get("daily_summary_ist"):
                     HUB.telegram["daily_summary_ist"] = str(body["daily_summary_ist"]).strip()
+                    changed = True
+                if body.get("alert_scope") and str(body["alert_scope"]).upper() in ("CONSOLIDATED", "LIVE_ONLY", "DEFAULT_ONLY"):
+                    HUB.telegram["alert_scope"] = str(body["alert_scope"]).upper()
                     changed = True
                 for k in ("alert_open", "alert_partial", "alert_close", "alert_daily", "alert_error"):
                     if k in body:
