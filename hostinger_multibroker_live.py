@@ -47,7 +47,7 @@ MULTIBROKER_JOURNAL_PATH = os.path.join(BASE_DIR, "live_journal_multibroker.json
 MULTIBROKER_CONFIG_PATH = os.path.join(BASE_DIR, "multibroker_runtime_config.json")
 FROZEN_MODELS_PATH = os.path.join(BASE_DIR, "unified_frozen_models.json")
 L2_1M_HISTORY_PATH = os.path.join(BASE_DIR, "l2_1m_history.jsonl")
-JOURNAL_VERSION = 5
+JOURNAL_VERSION = 6
 DELTA_GST_MULT = 1.18
 
 PAIRS = ("XAUTUSD", "BTCUSD", "ETHUSD")
@@ -69,7 +69,7 @@ PAIR_SPECS: Dict[str, Dict[str, Any]] = {
         "product_id": 131253,
         "lot_size": 0.001,
         "maker_fee": 0.0001,
-        "taker_fee": 0.0002,
+        "taker_fee": 0.0001,
         "default_spread": 0.15,
         "max_spread": 0.65,
         "sl_min": 3.00,
@@ -753,7 +753,7 @@ class MultiBrokerAccountClient:
         int_lots = max(1, int(round(float(lots))))
         if self.broker_type != "DELTA" or not self.is_live_authenticated or self.entry_order_mode == "MARKET":
             res = self.place_market_order(symbol, direction, int_lots, ref_price, reduce_only=False)
-            res["entry_is_maker"] = False
+            res["entry_is_maker"] = (self.broker_type == "DELTA" and self.entry_order_mode == "MAKER_CHASER" and not self.is_live_authenticated)
             return res
 
         pid = PAIR_SPECS[symbol]["product_id"]
@@ -1797,10 +1797,55 @@ class UnifiedFloorHub:
                 with open(MULTIBROKER_JOURNAL_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, list):
+                    migrated_v6 = False
+                    paper_delta_ids = {a.id for a in self.accounts if a.broker_type == "DELTA" and a.mode == "PAPER"}
+                    maker_accts = {a.id: (a.entry_order_mode == "MAKER_CHASER") for a in self.accounts if a.broker_type == "DELTA"}
+                    def_acct = self.get_default_account()
+                    def_id = def_acct.id if def_acct else "acct_default"
+
                     for idx, t in enumerate(data[-1000:], 1):
-                        if isinstance(t, dict):
-                            t["id"] = idx
-                            self.closed_trades.append(t)
+                        if not isinstance(t, dict):
+                            continue
+                        t["id"] = idx
+                        aid = str(t.get("account_id") or def_id)
+                        sym = str(t.get("symbol") or "")
+                        jv = int(t.get("journal_v") or 0)
+                        if jv < 6 and t.get("broker_type", "DELTA") == "DELTA" and sym in PAIR_SPECS and aid in paper_delta_ids:
+                            spec = PAIR_SPECS[sym]
+                            qty_u = float(t.get("lots") or 0.0) * float(spec["lot_size"])
+                            e_px = float(t.get("entry_price") or 0.0)
+                            x_px = float(t.get("exit_price") or e_px)
+                            if qty_u > 0 and e_px > 0:
+                                in_mk = maker_accts.get(aid, True)
+                                ex_reason = str(t.get("exit_reason") or "")
+                                out_mk = any(tag in ex_reason for tag in ("SR_CEILING_TP", "EXCHANGE_MAKER_TP"))
+                                in_r = spec["maker_fee"] if in_mk else spec["taker_fee"]
+                                out_r = spec["maker_fee"] if out_mk else spec["taker_fee"]
+                                new_fee = round((qty_u * e_px * in_r + qty_u * x_px * out_r) * DELTA_GST_MULT, 2)
+                                gross_v = round(float(t.get("gross_pnl_usd") or 0.0), 2)
+                                t["fee_usd"] = new_fee
+                                t["net_pnl_usd"] = round(gross_v - new_fee, 2)
+                                t["journal_v"] = JOURNAL_VERSION
+                                migrated_v6 = True
+                        self.closed_trades.append(t)
+
+                    if migrated_v6:
+                        for a in self.accounts:
+                            if a.id in paper_delta_ids and 50.0 <= float(a.wallet_balance_usd) <= 150.0:
+                                a_net = sum(
+                                    float(tr.get("net_pnl_usd") or 0.0)
+                                    for tr in self.closed_trades
+                                    if (tr.get("account_id") or def_id) == a.id
+                                )
+                                a.wallet_balance_usd = round(100.0 + a_net, 2)
+                                a.free_margin_usd = a.wallet_balance_usd
+                        try:
+                            with open(MULTIBROKER_JOURNAL_PATH, "w", encoding="utf-8") as f:
+                                json.dump(list(self.closed_trades), f, indent=2)
+                            self.save_runtime_config()
+                            print("[JOURNAL V6 MIGRATION] Reconciled PAPER Delta fees & balances to official Delta India rates.")
+                        except Exception as e:
+                            print(f"[JOURNAL V6 SAVE NOTICE] {e}")
             except Exception as e:
                 print(f"[JOURNAL LOAD NOTICE] {e}")
 
@@ -3830,11 +3875,9 @@ class UnifiedStrategyEngine:
             if acct.sizing_mode == "FIXED_LOT":
                 lots = max(1, int(round(float(pcfg.get("lots", 100)))))
             else:
-                if symbol == "XAUTUSD":
-                    qty = acct.risk_usd / max(sl_dist, 0.5)
-                else:
-                    eff_sl = sl_dist + (spec["maker_fee"] + spec["taker_fee"]) * entry_px
-                    qty = acct.risk_usd / max(eff_sl, 0.5)
+                in_est = spec["maker_fee"] if acct.entry_order_mode == "MAKER_CHASER" else spec["taker_fee"]
+                eff_sl = sl_dist + (in_est + spec["taker_fee"]) * DELTA_GST_MULT * entry_px
+                qty = acct.risk_usd / max(eff_sl, 0.5)
                 lots = max(1, int(round(qty / lot_size)))
                 if acct.liq_guard and entry_px > 0 and acct.leverage > 1 and acct.free_margin_usd > 0:
                     safe_notional = acct.free_margin_usd * float(acct.leverage) * 0.85
@@ -4040,7 +4083,7 @@ class UnifiedStrategyEngine:
 
             spec = PAIR_SPECS[symbol]
             in_rate = spec["maker_fee"] if entry_is_maker else spec["taker_fee"]
-            fee_be_pts = ((in_rate + spec["taker_fee"]) * DELTA_GST_MULT * fill_px) + (0.25 / max(unit_qty, 0.0001)) if (acct.broker_type == "DELTA" and symbol == "XAUTUSD") else 0.0
+            fee_be_pts = (((in_rate + spec["taker_fee"]) * DELTA_GST_MULT * fill_px) + (0.05 * sl_dist)) if (acct.broker_type == "DELTA" and symbol == "XAUTUSD") else 0.0
             entry_fee = self._est_fee(acct, symbol, unit_qty if acct.broker_type == "DELTA" else float(lots), fill_px, is_maker=entry_is_maker, sides=1)
 
             pos_obj: Dict[str, Any] = {
@@ -4633,7 +4676,11 @@ class UnifiedStrategyEngine:
             HUB.save_trade(closed_row)
             HUB.save_runtime_config()
             def_acct = HUB.get_default_account()
-            is_primary_acct = (def_acct is None) or (acct.id == def_acct.id) or (acct.broker_type == "DELTA")
+            is_primary_acct = (
+                (def_acct is None)
+                or (acct.id == def_acct.id)
+                or (def_acct.mode == "PAUSED" or not def_acct.get_pair_cfg(symbol).get("enabled", True))
+            )
             if is_primary_acct:
                 orig_ag = str(pos.get("orig_agent") or pos.get("setup_agent") or "")
                 tf_lbl = str(pos.get("tf") or "5m")
@@ -4770,7 +4817,19 @@ def refresh_product_ids():
                 sym = str(p.get("symbol", ""))
                 if sym in PAIR_SPECS and p.get("id"):
                     PAIR_SPECS[sym]["product_id"] = int(p["id"])
-            print("[PRODUCTS] Verified Delta Exchange Product IDs:", {s: PAIR_SPECS[s]["product_id"] for s in PAIRS})
+                    try:
+                        mk_r = float(p.get("maker_commission_rate") or 0.0)
+                        tk_r = float(p.get("taker_commission_rate") or 0.0)
+                        if 0.0 < mk_r < 0.01:
+                            PAIR_SPECS[sym]["maker_fee"] = mk_r
+                        if 0.0 < tk_r < 0.01:
+                            PAIR_SPECS[sym]["taker_fee"] = tk_r
+                    except Exception:
+                        pass
+            print(
+                "[PRODUCTS] Verified Delta Exchange Product IDs & Fees:",
+                {s: (PAIR_SPECS[s]["product_id"], PAIR_SPECS[s]["maker_fee"], PAIR_SPECS[s]["taker_fee"]) for s in PAIRS},
+            )
     except Exception as e:
         print(f"[PRODUCTS] Using default Product IDs ({e})")
 
@@ -5147,11 +5206,19 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                 if def_acct is None:
                     pub_trades = []
                 else:
-                    pub_trades = [
-                        dict(t) for t in HUB.closed_trades
-                        if (t.get("account_id") == def_acct.id and t.get("broker_type", "DELTA") == "DELTA")
-                        or (not t.get("account_id") and t.get("broker_type", "DELTA") == "DELTA")
-                    ]
+                    pub_trades = []
+                    for seq_idx, t in enumerate(
+                        (
+                            tr for tr in HUB.closed_trades
+                            if (tr.get("account_id") == def_acct.id and tr.get("broker_type", "DELTA") == "DELTA")
+                            or (not tr.get("account_id") and tr.get("broker_type", "DELTA") == "DELTA")
+                        ),
+                        1,
+                    ):
+                        row = dict(t)
+                        row["global_id"] = row.get("id", seq_idx)
+                        row["id"] = seq_idx
+                        pub_trades.append(row)
             self._send_json(pub_trades)
             return
 
@@ -5201,10 +5268,19 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                 all_closed = list(raw_closed)
                 if req_acct != "ALL_ACCOUNTS":
                     all_open = [p for p in all_open if p.get("account_id") == target_id]
-                    all_closed = [
-                        t for t in all_closed
-                        if t.get("account_id") == target_id or (not t.get("account_id") and target_id == def_id)
-                    ]
+                    scoped_closed = []
+                    for seq_idx, t in enumerate(
+                        (
+                            tr for tr in all_closed
+                            if tr.get("account_id") == target_id or (not tr.get("account_id") and target_id == def_id)
+                        ),
+                        1,
+                    ):
+                        row = dict(t)
+                        row["global_id"] = row.get("id", seq_idx)
+                        row["id"] = seq_idx
+                        scoped_closed.append(row)
+                    all_closed = scoped_closed
                 payload = {
                     "accounts": [a.to_public_dict() for a in HUB.accounts],
                     "account_summaries": account_summaries,
