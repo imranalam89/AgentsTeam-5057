@@ -1,0 +1,17 @@
+# Secrets & live runtime state (NEVER commit to GitHub)
+.env
+.env.*
+!.env.example
+multibroker_runtime_config.json
+live_journal_multibroker.json
+*.jsonl
+*.jsonl.prev
+*.log
+
+# Python cache & OS files
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+Thumbs.db
