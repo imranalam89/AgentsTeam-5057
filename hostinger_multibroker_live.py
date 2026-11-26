@@ -49,6 +49,8 @@ FROZEN_MODELS_PATH = os.path.join(BASE_DIR, "unified_frozen_models.json")
 L2_1M_HISTORY_PATH = os.path.join(BASE_DIR, "l2_1m_history.jsonl")
 JOURNAL_VERSION = 6
 DELTA_GST_MULT = 1.18
+USD_TO_INR = float(os.getenv("USD_TO_INR", "90.0"))
+TG_DIVIDER = "────────────────────"
 
 PAIRS = ("XAUTUSD", "BTCUSD", "ETHUSD")
 BROKER_TYPES = ("DELTA", "PICKMYTRADE", "WEBHOOK", "MT5_API", "TRADOVATE_API")
@@ -384,6 +386,19 @@ def fmt_ist_datetime(ts: Optional[float] = None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M")
 
 
+def fmt_ist_datetime_sec(ts: Optional[float] = None) -> str:
+    dt = (datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)) + IST_OFFSET
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_usd_inr_html(usd_val: float) -> str:
+    v = float(usd_val)
+    inr_v = v * USD_TO_INR
+    usd_s = f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+    inr_s = f"₹+{inr_v:,.2f}" if inr_v >= 0 else f"₹-{abs(inr_v):,.2f}"
+    return f"{usd_s} USD ({inr_s} INR)"
+
+
 def fmt_ist_date(ts: Optional[float] = None) -> str:
     dt = (datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)) + IST_OFFSET
     return dt.strftime("%Y-%m-%d")
@@ -411,6 +426,7 @@ def load_env_config() -> Dict[str, Any]:
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", ""),
         "TELEGRAM_DAILY_IST": os.getenv("TELEGRAM_DAILY_IST", "23:55"),
+        "PUBLIC_JOURNAL_URL": os.getenv("PUBLIC_JOURNAL_URL", "http://62.72.31.29:5057/"),
         "INBOUND_WEBHOOK_TOKEN": os.getenv("INBOUND_WEBHOOK_TOKEN", ""),
     }
     if os.path.exists(ENV_PATH):
@@ -1645,7 +1661,7 @@ class UnifiedFloorHub:
             "bot_token": ENV_CFG["TELEGRAM_BOT_TOKEN"],
             "chat_id": ENV_CFG["TELEGRAM_CHAT_ID"],
             "daily_summary_ist": ENV_CFG["TELEGRAM_DAILY_IST"] or "23:55",
-            "alert_scope": "CONSOLIDATED",
+            "alert_scope": "DEFAULT_ONLY",
             "alert_open": True,
             "alert_partial": True,
             "alert_close": True,
@@ -1718,6 +1734,9 @@ class UnifiedFloorHub:
                 self.engine_paused = bool(data.get("engine_paused", False))
                 if isinstance(data.get("telegram"), dict):
                     self.telegram.update(data["telegram"])
+                    # Enforce single Default Delta account alerts (upgrade legacy CONSOLIDATED scope)
+                    if str(self.telegram.get("alert_scope", "")).upper() in ("", "CONSOLIDATED"):
+                        self.telegram["alert_scope"] = "DEFAULT_ONLY"
                 accts = data.get("accounts", [])
                 if isinstance(accts, list) and accts:
                     self.accounts = [MultiBrokerAccountClient(a, ENV_CFG["DELTA_BASE_URL"]) for a in accts]
@@ -1952,12 +1971,13 @@ class UnifiedFloorHub:
         self.executor.submit(self.send_telegram, text, kind)
 
     def account_matches_telegram_scope(self, acct: MultiBrokerAccountClient) -> bool:
-        scope = str(self.telegram.get("alert_scope", "CONSOLIDATED")).upper()
+        """Strictly sends Telegram alerts ONLY for the Default DELTA account (no multi-account clutter)."""
+        def_a = self.get_default_account()
+        if not def_a or acct.id != def_a.id or acct.broker_type != "DELTA":
+            return False
+        scope = str(self.telegram.get("alert_scope", "DEFAULT_ONLY")).upper()
         if scope == "LIVE_ONLY":
             return acct.mode == "LIVE"
-        if scope == "DEFAULT_ONLY":
-            def_a = self.get_default_account()
-            return bool(def_a and acct.id == def_a.id)
         return True
 
     def queue_trail_or_partial_telegram(
@@ -1969,105 +1989,84 @@ class UnifiedFloorHub:
         acct: MultiBrokerAccountClient,
         detail_str: str,
     ):
-        """Consolidates Trailing SL / Partial TP updates across all accounts into ONE single Telegram message."""
+        """Sends a single Agentic-Brain formatted Trailing SL / Partial TP alert for the Default Delta account."""
         if not self.account_matches_telegram_scope(acct):
             return
         sym = str(pos["symbol"])
         direc = str(pos["direction"])
+        side_word = "BUY" if direc == "LONG" else "SELL"
         dedup_k = f"{event_kind}|{sym}|{direc}|{milestone_key}"
-        bkey = (sym, direc, milestone_key)
-        first_item = False
         with self.lock:
             now_f = time.time()
-            # Prune expired dedup keys
             if len(self._tg_dedup) > 300:
                 for dk in [k for k, ts_v in self._tg_dedup.items() if now_f - ts_v > 14400]:
                     self._tg_dedup.pop(dk, None)
-            # Block duplicate firing for the same milestone after flush
-            if dedup_k in self._tg_dedup and (now_f - self._tg_dedup[dedup_k]) > 1.5:
+            if dedup_k in self._tg_dedup:
                 return
-            if bkey not in self._tg_trail_buf:
-                self._tg_dedup[dedup_k] = now_f
-                self._tg_trail_buf[bkey] = []
-                first_item = True
-            self._tg_trail_buf[bkey].append((
-                {
-                    "title": title_label,
-                    "event_kind": event_kind,
-                    "entry_price": float(pos["entry_price"]),
-                    "cur_sl": float(pos["cur_sl"]),
-                    "current_price": float(pos.get("current_price", pos["entry_price"])),
-                    "detail": detail_str,
-                },
-                acct,
-            ))
+            self._tg_dedup[dedup_k] = now_f
 
-        if first_item:
-            def _flush_trail():
-                time.sleep(1.0)
-                with self.lock:
-                    items = self._tg_trail_buf.pop(bkey, [])
-                if not items:
-                    return
-                meta0 = items[0][0]
-                hdr_icon = "🎯" if meta0["event_kind"] == "PARTIAL" else "🛡️"
-                lines = [
-                    f"{hdr_icon} <b>{meta0['title']} · {sym} ({direc})</b>",
-                    f"Entry: <b>${meta0['entry_price']:.2f}</b> → Live: <b>${meta0['current_price']:.2f}</b>",
-                    f"Protected SL: <b>${meta0['cur_sl']:.2f}</b>",
-                ]
-                seen_ids = set()
-                for m_item, a_obj in items:
-                    if a_obj.id in seen_ids:
-                        continue
-                    seen_ids.add(a_obj.id)
-                    lines.append(f"• <b>{a_obj.label}</b> [{a_obj.mode}]: {m_item['detail']}")
-                self.send_telegram("\n".join(lines), kind="partial")
+        j_url = ENV_CFG["PUBLIC_JOURNAL_URL"]
+        e_px = float(pos["entry_price"])
+        cur_sl = float(pos["cur_sl"])
+        live_px = float(pos.get("current_price", e_px))
+        lots_v = pos.get("lots", 0)
 
-            self.executor.submit(_flush_trail)
+        if event_kind == "PARTIAL":
+            msg = (
+                f"🎯 <b>PARTIAL TP EXECUTED ({title_label})</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"📌 <b>Asset:</b> <code>{sym} ({side_word})</code>\n"
+                f"💵 <b>Entry Price:</b> <code>${e_px:,.2f}</code>\n"
+                f"🏁 <b>Scale Out:</b> <code>{detail_str}</code>\n"
+                f"🛑 <b>Protected SL:</b> <code>${cur_sl:,.2f}</code>\n"
+                f"🕒 <b>Time:</b> <code>{fmt_ist_datetime_sec()}</code>\n"
+                f"{TG_DIVIDER}\n"
+                f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>"
+            )
+        else:
+            msg = (
+                f"🛡️ <b>{title_label}</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"📌 <b>Asset:</b> <code>{sym} ({side_word})</code>\n"
+                f"💵 <b>Entry Price:</b> <code>${e_px:,.2f}</code>\n"
+                f"📈 <b>Live Price:</b> <code>${live_px:,.2f}</code>\n"
+                f"🛑 <b>Protected SL:</b> <code>{detail_str}</code>\n"
+                f"📦 <b>Lots:</b> <code>{lots_v} Lots</code>\n"
+                f"🕒 <b>Time:</b> <code>{fmt_ist_datetime_sec()}</code>\n"
+                f"{TG_DIVIDER}\n"
+                f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>"
+            )
+        self.send_telegram_async(msg, kind="partial")
 
     def queue_close_telegram(self, closed_row: Dict[str, Any], acct: MultiBrokerAccountClient):
-        """Consolidates simultaneous multi-account exits on the same trade into ONE single Telegram message."""
+        """Sends a single Agentic-Brain formatted Trade Closed alert strictly for the Default Delta account."""
         if not self.account_matches_telegram_scope(acct):
             return
         sym = str(closed_row["symbol"])
         direc = str(closed_row["direction"])
-        bkey = (sym, direc)
-        first_item = False
-        with self.lock:
-            if bkey not in self._tg_close_buf:
-                self._tg_close_buf[bkey] = []
-                first_item = True
-            self._tg_close_buf[bkey].append((dict(closed_row), acct))
+        side_word = "BUY" if direc == "LONG" else "SELL"
+        net_v = float(closed_row.get("net_pnl_usd", 0.0))
+        r_v = float(closed_row.get("r_multiple", 0.0))
+        e_px = float(closed_row.get("entry_price", 0.0))
+        x_px = float(closed_row.get("exit_price", 0.0))
+        raw_reason = str(closed_row.get("exit_reason") or "EXIT")
+        hdr_reason = raw_reason.replace("_", " ")
+        hdr_icon = "🟢" if net_v >= 0 else "🛑"
+        j_url = ENV_CFG["PUBLIC_JOURNAL_URL"]
 
-        if first_item:
-            def _flush_close():
-                time.sleep(1.2)
-                with self.lock:
-                    items = self._tg_close_buf.pop(bkey, [])
-                if not items:
-                    return
-                r0 = items[0][0]
-                any_win = any(float(x[0].get("net_pnl_usd", 0.0)) >= 0 for x in items)
-                icon = "🟢" if any_win else "🔴"
-                lines = [
-                    f"{icon} <b>TRADE CLOSED · {sym} ({direc})</b>",
-                    f"Reason: <b>{r0['exit_reason']}</b>",
-                    f"Entry: <b>${float(r0['entry_price']):.2f}</b> → Exit: <b>${float(r0['exit_price']):.2f}</b> ({float(r0['r_multiple']):+.2f}R)",
-                ]
-                seen_ids = set()
-                for row_i, a_obj in items:
-                    if a_obj.id in seen_ids:
-                        continue
-                    seen_ids.add(a_obj.id)
-                    net_v = float(row_i.get("net_pnl_usd", 0.0))
-                    b_sym = row_i.get("broker_symbol", sym)
-                    lines.append(
-                        f"• <b>{a_obj.label}</b> [{a_obj.mode} · {b_sym}]: <b>${net_v:+.2f}</b>"
-                    )
-                self.send_telegram("\n".join(lines), kind="close")
-
-            self.executor.submit(_flush_close)
+        msg = (
+            f"{hdr_icon} <b>TRADE CLOSED ({hdr_reason})</b>\n"
+            f"{TG_DIVIDER}\n"
+            f"📌 <b>Asset:</b> <code>{sym} ({side_word})</code>\n"
+            f"💵 <b>Entry Price:</b> <code>${e_px:,.2f}</code>\n"
+            f"🏁 <b>Exit Price:</b> <code>${x_px:,.2f} ({r_v:+.2f}R)</code>\n"
+            f"📊 <b>Net Realized P&amp;L:</b> <b>{fmt_usd_inr_html(net_v)}</b>\n"
+            f"📝 <b>Reason:</b> <code>{raw_reason}</code>\n"
+            f"🕒 <b>Time:</b> <code>{fmt_ist_datetime_sec()}</code>\n"
+            f"{TG_DIVIDER}\n"
+            f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>"
+        )
+        self.send_telegram_async(msg, kind="close")
 
     def check_ist_daily_summary(self):
         tg = self.telegram
@@ -2088,13 +2087,18 @@ class UnifiedFloorHub:
             gross = sum(float(t.get("gross_pnl_usd", 0)) for t in day_trades)
             fees = sum(float(t.get("fee_usd", 0)) for t in day_trades)
             net = sum(float(t.get("net_pnl_usd", 0)) for t in day_trades)
+            j_url = ENV_CFG["PUBLIC_JOURNAL_URL"]
             msg = (
-                f"📊 <b>MULTI-BROKER JOURNAL · IST DAILY SUMMARY ({cur_date})</b>\n"
-                f"Account: <b>{def_acct.label}</b>\n"
-                f"Trades Closed: <b>{len(day_trades)}</b> ({wins}W / {len(day_trades)-wins}L)\n"
-                f"Gross P&amp;L: <b>${gross:+.2f}</b>\n"
-                f"Brokerage Fees: <b>-${fees:.2f}</b>\n"
-                f"Net Realized P&amp;L: <b>${net:+.2f}</b>"
+                f"🧠 <b>AGENTIC BRAIN • IST DAILY SUMMARY</b>\n\n"
+                f"{'🟢' if net >= 0 else '🛑'} <b>SESSION REPORT ({cur_date})</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"📌 <b>Account:</b> <code>{def_acct.label}</code>\n"
+                f"📦 <b>Trades Closed:</b> <code>{len(day_trades)} ({wins}W / {len(day_trades)-wins}L)</code>\n"
+                f"💵 <b>Gross P&amp;L:</b> <code>{gross:+.2f} USD</code>\n"
+                f"🧾 <b>Brokerage Fees:</b> <code>-${fees:,.2f} USD</code>\n"
+                f"📊 <b>Net Realized P&amp;L:</b> <b>{fmt_usd_inr_html(net)}</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>"
             )
             self.send_telegram_async(msg, kind="daily")
 
@@ -4168,6 +4172,7 @@ class UnifiedStrategyEngine:
                 "lots": fmt_qty_json(lots),
                 "fill_px": fill_px,
                 "init_sl": init_sl,
+                "tp_price": tp_display_px,
             }
 
         def _fanout_and_notify_open():
@@ -4182,18 +4187,35 @@ class UnifiedStrategyEngine:
                     pass
             if not opened_items:
                 return
-            first = opened_items[0]
-            lines = [
-                f"🚀 <b>TRADE OPENED · {symbol} ({direction})</b>",
-                f"Agent: <b>{sig['setup_agent']}</b> ({sig['tf']} · {sig['playbook']})",
-                f"Entry: <b>${first['fill_px']:.2f}</b> → Init SL: <b>${first['init_sl']:.2f}</b> ({sl_dist:.2f} pts · {sig['sl_tier']})",
-            ]
-            for it in opened_items:
-                a_obj = it["acct"]
-                lines.append(
-                    f"• <b>{a_obj.label}</b> [{a_obj.mode} · {it['b_sym']}]: <b>{it['lots']}</b> @ ${it['fill_px']:.2f}"
-                )
-            HUB.send_telegram("\n".join(lines), kind="open")
+            def_item = opened_items[0]
+            def_acct = def_item["acct"]
+            order_mode_lbl = "DELTA LIVE ORDER" if def_acct.is_live_authenticated else "DELTA PAPER ORDER"
+            side_word = "BUY" if direction == "LONG" else "SELL"
+            exec_dot = "🟢" if direction == "LONG" else "🔴"
+            tp_px_val = float(def_item.get("tp_price") or 0.0)
+            tp_str = f"${tp_px_val:,.2f}" if tp_px_val > 0 else "Trailing Runner"
+            lots_val = def_item["lots"]
+            risk_str = f"${def_acct.risk_usd:,.2f}" if def_acct.sizing_mode == "RISK_USD" else f"Fixed {lots_val} Lots"
+            j_url = ENV_CFG["PUBLIC_JOURNAL_URL"]
+
+            msg = (
+                f"🧠 <b>AGENTIC BRAIN • {order_mode_lbl}</b>\n\n"
+                f"{exec_dot} <b>{side_word} ORDER EXECUTED</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"📌 <b>Asset:</b> <code>{symbol}</code>\n"
+                f"🎯 <b>Direction:</b> <code>{side_word}</code>\n"
+                f"🤖 <b>Agent:</b> <code>{sig['setup_agent']} ({sig['tf']})</code>\n"
+                f"💵 <b>Entry Price:</b> <code>${def_item['fill_px']:,.2f}</code>\n"
+                f"🛑 <b>Stop Loss:</b> <code>${def_item['init_sl']:,.2f}</code>\n"
+                f"🎯 <b>Take Profit:</b> <code>{tp_str}</code>\n"
+                f"📦 <b>Lots:</b> <code>{lots_val} Lots</code>\n"
+                f"⚡ <b>Leverage:</b> <code>{def_acct.leverage}x Cross</code>\n"
+                f"🛡️ <b>Strict Risk:</b> <code>{risk_str}</code>\n"
+                f"🕒 <b>Time:</b> <code>{fmt_ist_datetime_sec()}</code>\n"
+                f"{TG_DIVIDER}\n"
+                f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>"
+            )
+            HUB.send_telegram(msg, kind="open")
 
         HUB.executor.submit(_fanout_and_notify_open)
 
@@ -4246,10 +4268,10 @@ class UnifiedStrategyEngine:
         HUB.queue_trail_or_partial_telegram(
             event_kind="PARTIAL",
             milestone_key=f"PARTIAL_{tag}_{int(pos.get('entry_ts', 0) // 60)}",
-            title_label=f"PARTIAL TP ({tag})",
+            title_label=str(tag),
             pos=pos,
             acct=acct,
-            detail_str=f"Scaled {fmt_qty_json(take_lots)} @ ${fill_px:.2f} (Runner: {pos['lots']})",
+            detail_str=f"{fmt_qty_json(take_lots)} Lots @ ${fill_px:,.2f} (Runner: {pos['lots']} Lots)",
         )
 
     def manage_position(self, account_id: str, symbol: str, h_px: float, l_px: float, c_px: float, is_bar_close: bool = False, ctx: Optional[Dict[str, Any]] = None):
@@ -4539,35 +4561,40 @@ class UnifiedStrategyEngine:
                     sl_dist, float(pos.get("tp_dist", 0.0)), trail_offset=trail_offset,
                     reason=pos.get("stage_reason") or "TRAIL_SL",
                 )
-            # Send ONE consolidated Trailing SL milestone alert (throttled to stage/0.5R milestones, never 1s spam)
+            # Send ONE Default-Delta Trailing SL milestone alert (throttled to clean milestones, no back-to-back burst)
             locked_r = round(s_mult * (float(pos["cur_sl"]) - e_px) / max(sl_dist, 1e-6), 2)
             st_reason = str(pos.get("stage_reason") or "TRAIL_SL")
             entry_bucket = int(pos.get("entry_ts", 0) // 60)
+            last_alert_r = float(pos.get("last_alerted_locked_r", -99.0))
+            last_alert_ts = float(pos.get("last_trail_alert_ts", 0.0))
             milestone_id = ""
             milestone_title = ""
             if st_reason == "SMART_STALL_LOCK" and not pos.get("alerted_stall"):
                 pos["alerted_stall"] = True
                 milestone_id = f"STALL_{entry_bucket}"
-                milestone_title = "TRAILING SL (STALL LOCK)"
+                milestone_title = f"TRAILING SL (STALL LOCK · {locked_r:+.2f}R)"
             elif st_reason in ("BREAKEVEN", "TP1_FLOOR", "TP2_FLOOR") and not pos.get("alerted_be"):
                 pos["alerted_be"] = True
                 milestone_id = f"BE_{entry_bucket}"
-                milestone_title = "BREAKEVEN LOCKED"
+                milestone_title = f"BREAKEVEN LOCKED ({locked_r:+.2f}R)"
             elif pos.get("stage", 0) >= 4:
-                step_half_r = int(math.floor(max(0.0, locked_r) * 2.0))  # 1=+0.5R, 2=+1.0R, 3=+1.5R...
+                step_half_r = int(math.floor(max(0.0, locked_r) * 2.0))
                 prev_step = int(pos.get("last_trail_alert_step", 0))
-                if step_half_r >= 1 and step_half_r > prev_step:
+                # Avoid firing a second trail alert 2s after Breakeven unless locked_r jumped by >= +0.40R
+                if step_half_r >= 1 and step_half_r > prev_step and ((time.time() - last_alert_ts) >= 20.0 or (locked_r - last_alert_r) >= 0.40):
                     pos["last_trail_alert_step"] = step_half_r
                     milestone_id = f"RATCHET_{entry_bucket}_{step_half_r}"
-                    milestone_title = f"TRAILING SL (+{step_half_r * 0.5:.1f}R LOCKED)"
+                    milestone_title = f"TRAILING SL ({locked_r:+.2f}R LOCKED)"
             if milestone_id:
+                pos["last_alerted_locked_r"] = locked_r
+                pos["last_trail_alert_ts"] = time.time()
                 HUB.queue_trail_or_partial_telegram(
                     event_kind="TRAIL",
                     milestone_key=milestone_id,
                     title_label=milestone_title,
                     pos=pos,
                     acct=acct,
-                    detail_str=f"SL → ${float(pos['cur_sl']):.2f} ({locked_r:+.2f}R)",
+                    detail_str=f"${float(pos['cur_sl']):,.2f} ({locked_r:+.2f}R)",
                 )
 
         # 9. Time Cycle Exit
@@ -5351,7 +5378,7 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     "bot_token_masked": mask_secret(tg.get("bot_token", ""), "tg_"),
                     "chat_id": tg.get("chat_id", ""),
                     "daily_summary_ist": tg.get("daily_summary_ist", "23:55"),
-                    "alert_scope": str(tg.get("alert_scope", "CONSOLIDATED")),
+                    "alert_scope": str(tg.get("alert_scope", "DEFAULT_ONLY")),
                     "alert_open": bool(tg.get("alert_open", True)),
                     "alert_partial": bool(tg.get("alert_partial", True)),
                     "alert_close": bool(tg.get("alert_close", True)),
@@ -5779,7 +5806,7 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                     HUB.telegram["chat_id"] = str(body.get("chat_id", "")).strip()
                 if "daily_summary_ist" in body:
                     HUB.telegram["daily_summary_ist"] = str(body.get("daily_summary_ist", "23:55")).strip()
-                if "alert_scope" in body and str(body["alert_scope"]).upper() in ("CONSOLIDATED", "LIVE_ONLY", "DEFAULT_ONLY"):
+                if "alert_scope" in body and str(body["alert_scope"]).upper() in ("DEFAULT_ONLY", "LIVE_ONLY"):
                     HUB.telegram["alert_scope"] = str(body["alert_scope"]).upper()
                 for k in ("alert_open", "alert_partial", "alert_close", "alert_daily", "alert_error"):
                     if k in body:
@@ -5804,7 +5831,7 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                 if body.get("daily_summary_ist"):
                     HUB.telegram["daily_summary_ist"] = str(body["daily_summary_ist"]).strip()
                     changed = True
-                if body.get("alert_scope") and str(body["alert_scope"]).upper() in ("CONSOLIDATED", "LIVE_ONLY", "DEFAULT_ONLY"):
+                if body.get("alert_scope") and str(body["alert_scope"]).upper() in ("DEFAULT_ONLY", "LIVE_ONLY"):
                     HUB.telegram["alert_scope"] = str(body["alert_scope"]).upper()
                     changed = True
                 for k in ("alert_open", "alert_partial", "alert_close", "alert_daily", "alert_error"):
@@ -5814,9 +5841,23 @@ class UnifiedJournalHTTPHandler(SimpleHTTPRequestHandler):
                 if changed:
                     HUB.save_runtime_config()
                 masked = mask_secret(HUB.telegram.get("bot_token", ""), "tg_")
+                def_acct = HUB.get_default_account()
+                acct_lbl = def_acct.label if def_acct else "Primary Delta Account"
+                acct_mode = def_acct.mode if def_acct else "PAPER"
+                acct_lev = f"{def_acct.leverage}x Cross" if def_acct else "100x Cross"
+                acct_rk = f"${def_acct.risk_usd:,.2f}" if (def_acct and def_acct.sizing_mode == "RISK_USD") else "Fixed Lots"
+            j_url = ENV_CFG["PUBLIC_JOURNAL_URL"]
             ok, msg = HUB.send_telegram(
-                "✅ <b>TRADING JOURNAL · MULTI-BROKER 3-ASSET FLOOR (PORT 5057)</b>\n"
-                "Telegram alert connection verified! Live multi-broker alerts &amp; IST daily summaries are active.",
+                f"🧠 <b>AGENTIC BRAIN • DELTA CONNECTION VERIFIED</b>\n\n"
+                f"🟢 <b>TELEGRAM ALERTS ACTIVE (PORT 5057)</b>\n"
+                f"{TG_DIVIDER}\n"
+                f"📌 <b>Account:</b> <code>{acct_lbl} ({acct_mode})</code>\n"
+                f"🎯 <b>Assets:</b> <code>XAUTUSD • BTCUSD • ETHUSD</code>\n"
+                f"⚡ <b>Leverage:</b> <code>{acct_lev}</code>\n"
+                f"🛡️ <b>Strict Risk:</b> <code>{acct_rk}</code>\n"
+                f"🕒 <b>Time:</b> <code>{fmt_ist_datetime_sec()}</code>\n"
+                f"{TG_DIVIDER}\n"
+                f"🔗 <a href=\"{j_url}\">Open Live Trading Journal</a>",
                 kind="test",
             )
             self._send_json({"success": ok, "error": None if ok else msg, "bot_token_masked": masked})

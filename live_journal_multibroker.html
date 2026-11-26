@@ -2588,11 +2588,10 @@
               </div>
             </div>
             <div>
-              <label for="tgAlertScope" class="field-lbl">Alert Mode (1 Message Per Entry / Trail / Exit)</label>
+              <label for="tgAlertScope" class="field-lbl">Alert Mode (Default Delta Account Only — Agentic Brain Style)</label>
               <select id="tgAlertScope" class="select-dark mono" style="width:100%;">
-                <option value="CONSOLIDATED" ${(tg.alert_scope || 'CONSOLIDATED') === 'CONSOLIDATED' ? 'selected' : ''}>1 COMBINED ALERT (Lists All Executed Accounts Together — No Duplicates)</option>
-                <option value="LIVE_ONLY" ${tg.alert_scope === 'LIVE_ONLY' ? 'selected' : ''}>LIVE ACCOUNTS ONLY (Skips PAPER Test Accounts)</option>
-                <option value="DEFAULT_ONLY" ${tg.alert_scope === 'DEFAULT_ONLY' ? 'selected' : ''}>DEFAULT DELTA ACCOUNT ONLY</option>
+                <option value="DEFAULT_ONLY" ${(tg.alert_scope || 'DEFAULT_ONLY') !== 'LIVE_ONLY' ? 'selected' : ''}>DEFAULT DELTA ACCOUNT (LIVE + PAPER)</option>
+                <option value="LIVE_ONLY" ${tg.alert_scope === 'LIVE_ONLY' ? 'selected' : ''}>DEFAULT DELTA ACCOUNT (LIVE MODE ONLY)</option>
               </select>
             </div>
             <div class="mono" style="display:flex; flex-wrap:wrap; gap:10px; font-size:11.5px;">
